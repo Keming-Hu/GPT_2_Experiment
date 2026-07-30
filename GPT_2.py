@@ -251,10 +251,12 @@ model.to(my_device)
 
 train_loader = DataLoaderLite(B=16, T=1024)
 
+torch.set_float32_matmul_precision('high')
+
 #Check GPT_1.ipynb for AdamW.
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
-    t0 = time.tiem()
+    t0 = time.time()
 
     x, y = train_loader.next_batch()
     #note that the DataLoaderLite class is a CPU-based class, 
@@ -263,14 +265,16 @@ for i in range(50):
     y = y.to(my_device)
     optimizer.zero_grad()
     logits, loss = model(x, y)
+    import code; code.interact(local=locals())
     loss.backward()
     optimizer.step() #perform a single optimization step
-
+    #
     #wait for GPU to finish the current epoch, so that timing is not just counting the CPU ("GPU queue assigning") time
     torch.cuda.synchronize() 
     t1 = time.time()
     dt = (t1-t0)*1000
-    print(f"step {i}: loss {loss.item()}, dt={dt:.2f}ms")
+    tokens_per_sec = (train_loader.B * train_loader.T)/(t1-t0)
+    print(f"step {i}: loss {loss.item()}, dt={dt:.2f}ms, tokens_per_sec={tokens_per_sec:.2f}")
     #notice that .item() is able to carry var back to CPU and print.
 
 import sys; sys.exit(0)
