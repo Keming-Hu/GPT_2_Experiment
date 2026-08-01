@@ -35,10 +35,12 @@ class CausalSelfAttention(nn.Module):
         K = K.view(B, T, self.n_head, C // self.n_head).transpose(1,2)
         V = V.view(B, T, self.n_head, C // self.n_head).transpose(1,2)
 
-        att = (Q @ K.transpose(2,3)) * (K.size(-1)**-0.5) # (B,nh,T,hs) @ (B,nh,hs,T) = (B,nh,T,T)
-        att = att.masked_fill(self.bias[:, :, :T, :T]==0, float('-inf')) 
-        att = F.softmax(att, dim=-1)
-        y = att @ V # (B,nh,T,T) @ (B,nh,T,hs) = (B,nh,T,hs)
+        y = F.scaled_dot_product_attention(Q,K,V, is_causal = True) #The flash attention version
+        #att = (Q @ K.transpose(2,3)) * (K.size(-1)**-0.5) # (B,nh,T,hs) @ (B,nh,hs ,T) = (B,nh,T,T)
+        #att = att.masked_fill(self.bias[:, :, :T, :T]==0, float('-inf')) 
+        #att = F.softmax(att, dim=-1)
+        #y = att @ V # (B,nh,T,T) @ (B,nh,T,hs) = (B,nh,T,hs)
+        
         y = y.transpose(1,2).contiguous().view(B,T,C)
         y = self.c_proj(y)
 
@@ -245,7 +247,9 @@ if torch.cuda.is_available():
     torch.cuda.random.manual_seed(1337)
 
 #model = GPT.from_pretrained('gpt2')
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304)) #50304%128=0, a nicer number than the natural 50257, so OVERWRITE
+
+
 #model.eval() #using evaluation mode, shutoff special layers like dropout, do minor optimization (maybe)
 model.to(my_device)
 #using torch.compile to accelerate
@@ -255,8 +259,8 @@ train_loader = DataLoaderLite(B=16, T=1024)
 
 torch.set_float32_matmul_precision('high')
 
-#Check GPT_1.ipynb for AdamW.
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+#Check GPT_1.ipynb for AdamW. Hyperparams taken from GPT-3 paper
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8) 
 
 end_event = torch.cuda.Event()
 
@@ -273,6 +277,14 @@ for i in range(50):
         logits, loss = model(x, y)
     #if i==3:import code; code.interact(local=locals())
     loss.backward()
+
+    #norm is the Euclidean length of the param gradients. Restriction is equivalent to restricting the step length in high-dimensional space.
+    norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0) #clip gradient to avoid exploding
+
+    #Get the Cosine Decay LR:
+    lr = getlr(i)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step() #perform a single optimization step
 
     #wait for GPU to finish the current epoch, so that timing is not just counting the CPU ("GPU queue assigning") time
@@ -283,7 +295,7 @@ for i in range(50):
 
     dt = (t1-t0) *1000
     tokens_per_sec = (train_loader.B * train_loader.T)/(t1-t0)
-    print(f"step {i}: loss {loss.item()}, dt={dt:.2f}ms, tokens_per_sec={tokens_per_sec:.2f}")
+    print(f"step {i}: loss {loss.item()} | norm {norm:.4f} | dt={dt:.2f}ms |  tokens_per_sec={tokens_per_sec:.2f}")
     #notice that .item() is able to carry var back to CPU and print.
 
 import sys; sys.exit(0)
