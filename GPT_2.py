@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn 
 from torch.nn import functional as F
 import tiktoken
+import inspect
 
 class CausalSelfAttention(nn.Module):
 
@@ -206,6 +207,38 @@ class GPT(nn.Module):
 
         return model
 
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        # filter out those that do not require grad
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2] #weights & embeddings
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2] #bias & buffers
+
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0} #initialize to 0 because they don't affect the grad
+        ]
+
+        # collect the number of tensors & params of each kind
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+
+        # Create AdamW optimizer and use the fused version if it is available
+        #check if 'fused' is in the AdamW's **kwargs in the current version; if so, make an extra kwarg dict
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters 
+        use_fused = fused_available and device_type == 'cuda'
+        extra_args = dict(fused=True) if use_fused else dict()
+        torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8) 
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, eps=1e-8, **extra_args)
+        print(f"using fused AdamW: {use_fused}")
+
+        return optimizer
+
+
 class DataLoaderLite:
 
     def __init__(self, B, T):
@@ -229,7 +262,7 @@ class DataLoaderLite:
         buf = self.tokens[self.current_position : self.current_position + B*T +1]
         x = buf[:-1].view(B,T)
         y = buf[1:].view(B,T)
-        self.current_position += B*T
+        self.current_position += B*T #WITHOUT Replacement
 
         if self.current_position + B*T +1 > len(self.tokens): #note that the range above is [,), so use '>'
             self.current_position = 0
@@ -259,14 +292,33 @@ train_loader = DataLoaderLite(B=16, T=1024)
 
 torch.set_float32_matmul_precision('high')
 
+max_lr = 6e-4 #according to GPT-3 small (125M)
+min_lr = max_lr * 0.1 #according to GPT-3
+warmup_steps = 10 #The climbing linear warmup in cosine decay
+max_steps = 50
+
+import math
+
+def get_lr(it):
+    if it < warmup_steps:
+        return max_lr * (it+1) / warmup_steps #linear climb to max LR
+    if it > max_steps:
+        return min_lr #the low LR tail
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert (0<=decay_ratio and decay_ratio<=1)
+    coeff = 0.5 * (1.0 + math.cos(math.pi*decay_ratio)) #take cos phase 0pi~1 pi, map to range [0,1]
+    return min_lr + coeff * (max_lr-min_lr)
+
+
 #Check GPT_1.ipynb for AdamW. Hyperparams taken from GPT-3 paper
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8) 
+#optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8) 
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=3e-4, betas=(0.9,0.95), device_type=my_device)
 
 end_event = torch.cuda.Event()
 
 for i in range(50):
     t0 = time.perf_counter()
-
+ 
     x, y = train_loader.next_batch()
     #note that the DataLoaderLite class is a CPU-based class, 
     #so we need to ship tensors to GPU explicityly
@@ -282,7 +334,7 @@ for i in range(50):
     norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0) #clip gradient to avoid exploding
 
     #Get the Cosine Decay LR:
-    lr = getlr(i)
+    lr = get_lr(i)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     optimizer.step() #perform a single optimization step
