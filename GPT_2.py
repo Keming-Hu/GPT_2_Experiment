@@ -272,7 +272,7 @@ class DataLoaderLite:
 #DDP: Distributed Data Parallel
 #** Everything below will likely be running in 8 parallel processes separately
 from torch.distributed import init_process_group, destroy_process_group
-
+import os
 # using torchrun command to set up env var like: RANK, LOCAL_RANK, WORLD_SIZE
 ddp = (int(os.environ.get('RANK',-1)) != -1) #a boolean: is this a DDP run?
 #os.environ returns a dict of OS settings; dict.get(key, default_val) returns default_val if key not found, else return value given by key
@@ -280,9 +280,9 @@ ddp = (int(os.environ.get('RANK',-1)) != -1) #a boolean: is this a DDP run?
 if ddp:
     assert torch.cuda.is_available(), 'Need CUDA for DDP'
     init_process_group(backend='nccl')
-    ddp_rank = os.environ['RANK'] #rank of the current GPU among all GPUs in a multi-GPU node. =0 in our situation
-    ddp_local_rank = os.environ['LOCAL_RANK'] #rank of the chunk (in the GPU) that hosts the current process
-    ddp_world_size = os.environ['WORLD_SIZE'] #number of chunks in the current GPU
+    ddp_rank = int(os.environ['RANK']) #rank of the current GPU among all GPUs in a multi-GPU node. =0 in our situation
+    ddp_local_rank = int(os.environ['LOCAL_RANK']) #rank of the chunk (in the GPU) that hosts the current process
+    ddp_world_size = int(os.environ['WORLD_SIZE']) #number of chunks in the current GPU
     my_device = f"cuda:{ddp_local_rank}"
     torch.cuda.set_device(my_device)
     master_process = (ddp_rank==0) #boolean: this process will do logging/checkpointing/...
