@@ -279,7 +279,16 @@ torch.random.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.random.manual_seed(1337)
 
-#model = GPT.from_pretrained('gpt2')
+#To run a big batch on a small GPU, use serial grad accumulation
+total_batch_size = 524288 #(1<<19), roughly 0.5M, ~GPT_2 small
+B = 16
+T = 1024
+assert total_batch_size % (B*T) == 0
+grad_accum_steps = total_batch_size / (B*T)
+print(f"total desired batch size: {total_batch_size}")
+print(f"Gradient accumulation steps in each batch: {grad_accum_steps}")
+
+#mode l = GPT.from_pretrained('gpt2')
 model = GPT(GPTConfig(vocab_size=50304)) #50304%128=0, a nicer number than the natural 50257, so OVERWRITE
 
 
@@ -312,26 +321,31 @@ def get_lr(it):
 
 #Check GPT_1.ipynb for AdamW. Hyperparams taken from GPT-3 paper
 #optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8) 
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=3e-4, betas=(0.9,0.95), device_type=my_device)
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, betas=(0.9,0.95), device_type=my_device)
 
 end_event = torch.cuda.Event()
 
 for i in range(50):
     t0 = time.perf_counter()
- 
-    x, y = train_loader.next_batch()
-    #note that the DataLoaderLite class is a CPU-based class, 
-    #so we need to ship tensors to GPU explicityly
-    x = x.to(my_device)
-    y = y.to(my_device)
+
     optimizer.zero_grad()
-    with torch.autocast(device_type=my_device, dtype= torch.bfloat16):  #upgrade to bf16 precision 
-        logits, loss = model(x, y)
-    #if i==3:import code; code.interact(local=locals())
-    loss.backward()
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        #note that the DataLoaderLite class is a CPU-based class, 
+        #so we need to ship tensors to GPU explicitly
+        x = x.to(my_device)
+        y = y.to(my_device)
+        with torch.autocast(device_type=my_device, dtype= torch.bfloat16):  #upgrade to bf16 precision 
+            logits, loss = model(x, y)
+        #BUG fix: loss calculation takes batch_size as normalizer; when batch is divided, we need to divide accum_steps to restore the normalizer
+        #Otherwise, gradients would be multiplied...
+        loss /= grad_accum_steps
+        loss_accum += loss.detach() #detach the tensor from the graph, to save mem
+        loss.backward() #since the zero_grad() is outside of the loop, loss grads accumulate here.
 
     #norm is the Euclidean length of the param gradients. Restriction is equivalent to restricting the step length in high-dimensional space.
-    norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0) #clip gradient to avoid exploding
+    norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0) #clip gradient to avoid dangerous steps
 
     #Get the Cosine Decay LR:
     lr = get_lr(i)
@@ -345,9 +359,9 @@ for i in range(50):
     
     t1 = time.perf_counter()
 
-    dt = (t1-t0) *1000
-    tokens_per_sec = (train_loader.B * train_loader.T)/(t1-t0)
-    print(f"step {i}: loss {loss.item()} | norm {norm:.4f} | dt={dt:.2f}ms |  tokens_per_sec={tokens_per_sec:.2f}")
+    dt = (t1-t0) * 1000
+    tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps)/(t1-t0)
+    print(f"step {i}: loss {loss_accum.item()} | norm {norm:.4f} | dt={dt:.2f}ms |  tokens_per_sec={tokens_per_sec:.2f}")
     #notice that .item() is able to carry var back to CPU and print.
 
 import sys; sys.exit(0)
