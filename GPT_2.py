@@ -4,6 +4,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import tiktoken
 import inspect
+import time
 
 class CausalSelfAttention(nn.Module):
 
@@ -268,25 +269,55 @@ class DataLoaderLite:
             self.current_position = 0
         return x,y
 #---------------------------------------------------------------------------------------------------------------------------
-import time
+#DDP: Distributed Data Parallel
+#** Everything below will likely be running in 8 parallel processes separately
+from torch.distributed import init_process_group, destroy_process_group
+
+# using torchrun command to set up env var like: RANK, LOCAL_RANK, WORLD_SIZE
+ddp = (int(os.environ.get('RANK',-1)) != -1) #a boolean: is this a DDP run?
+#os.environ returns a dict of OS settings; dict.get(key, default_val) returns default_val if key not found, else return value given by key
+
+if ddp:
+    assert torch.cuda.is_available(), 'Need CUDA for DDP'
+    init_process_group(backend='nccl')
+    ddp_rank = os.environ['RANK'] #rank of the current GPU among all GPUs in a multi-GPU node. =0 in our situation
+    ddp_local_rank = os.environ['LOCAL_RANK'] #rank of the chunk (in the GPU) that hosts the current process
+    ddp_world_size = os.environ['WORLD_SIZE'] #number of chunks in the current GPU
+    my_device = f"cuda:{ddp_local_rank}"
+    torch.cuda.set_device(my_device)
+    master_process = (ddp_rank==0) #boolean: this process will do logging/checkpointing/...
+    #set 'cuda:0' as the master process
+else:
+    #no DDP available, let's do vanilla version with the ddp variables set to default:
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    my_device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+    print("using device:", my_device) 
+
 
 num_return_sequences = 5
 max_length = 30
-my_device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
 print("using device:", my_device) 
 
 torch.random.manual_seed(1337)
 if torch.cuda.is_available():
-    torch.cuda.random.manual_seed(1337)
+    torch.cuda.random.manual_seed(1337) 
 
 #To run a big batch on a small GPU, use serial grad accumulation
 total_batch_size = 524288 #(1<<19), roughly 0.5M, ~GPT_2 small
 B = 16
 T = 1024
-assert total_batch_size % (B*T) == 0
-grad_accum_steps = total_batch_size / (B*T)
-print(f"total desired batch size: {total_batch_size}")
-print(f"Gradient accumulation steps in each batch: {grad_accum_steps}")
+assert total_batch_size % (B*T*ddp_world_size) == 0
+grad_accum_steps = total_batch_size //  (B*T*ddp_world_size)
+if master_process:
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"Gradient accumulation steps in each batch: {grad_accum_steps}")
+
+print(f'I am GPU {ddp_rank}')
+print('bye')
+import sys; sys.exit(0)
 
 #mode l = GPT.from_pretrained('gpt2')
 model = GPT(GPTConfig(vocab_size=50304)) #50304%128=0, a nicer number than the natural 50257, so OVERWRITE
