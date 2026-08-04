@@ -242,9 +242,11 @@ class GPT(nn.Module):
 
 class DataLoaderLite:
 
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_processes):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
 
         with open('input.txt','r') as f:
             text = f.read()
@@ -254,7 +256,7 @@ class DataLoaderLite:
         print(f"Total token length is: {len(tokens)}")
         print(f"1 Epoch contains {len(tokens) // (B*T)} batches")
 
-        self.current_position = 0
+        self.current_position = self.process_rank*self.B*self.T
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -263,15 +265,16 @@ class DataLoaderLite:
         buf = self.tokens[self.current_position : self.current_position + B*T +1]
         x = buf[:-1].view(B,T)
         y = buf[1:].view(B,T)
-        self.current_position += B*T #WITHOUT Replacement
+        self.current_position += B*T*self.num_processes #WITHOUT Replacement, go to the next batch
 
-        if self.current_position + B*T +1 > len(self.tokens): #note that the range above is [,), so use '>'
+        if self.current_position + B*T*self.num_processes +1 > len(self.tokens): #note that the range above is [,), so use '>'
             self.current_position = 0
         return x,y
 #---------------------------------------------------------------------------------------------------------------------------
 #DDP: Distributed Data Parallel
 #** Everything below will likely be running in 8 parallel processes separately
 from torch.distributed import init_process_group, destroy_process_group
+import torch.distributed as dist
 import os
 # using torchrun command to set up env var like: RANK, LOCAL_RANK, WORLD_SIZE
 ddp = (int(os.environ.get('RANK',-1)) != -1) #a boolean: is this a DDP run?
@@ -315,22 +318,22 @@ if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"Gradient accumulation steps in each batch: {grad_accum_steps}")
 
-print(f'I am GPU {ddp_rank}')
-print('bye')
-import sys; sys.exit(0)
 
+train_loader = DataLoaderLite(B=16, T=1024, process_rank = ddp_rank, num_processes = ddp_world_size)
+
+
+#8 identical models created in DDP
 #mode l = GPT.from_pretrained('gpt2')
 model = GPT(GPTConfig(vocab_size=50304)) #50304%128=0, a nicer number than the natural 50257, so OVERWRITE
-
-
 #model.eval() #using evaluation mode, shutoff special layers like dropout, do minor optimization (maybe)
 model.to(my_device)
 #using torch.compile to accelerate
 model = torch.compile(model)
+if ddp:
+    #Note:use 'ddp_local_rank'; this conversion allows (in backward pass) gradients from different GPUs to get averaged, and synchronized back to all GPUs
+    model = DDP(model, device_ids=[ddp_local_rank]) 
 
-train_loader = DataLoaderLite(B=16, T=1024)
-
-torch.set_float32_matmul_precision('high')
+#torch.set_float32_matmul_precision('high')
 
 max_lr = 6e-4 #according to GPT-3 small (125M)
 min_lr = max_lr * 0.1 #according to GPT-3
@@ -373,8 +376,13 @@ for i in range(50):
         #Otherwise, gradients would be multiplied...
         loss /= grad_accum_steps
         loss_accum += loss.detach() #detach the tensor from the graph, to save mem
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == (grad_accum_steps-1)) #only make gradient sync true on the last iteration
         loss.backward() #since the zero_grad() is outside of the loop, loss grads accumulate here.
-
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+    
+    
     #norm is the Euclidean length of the param gradients. Restriction is equivalent to restricting the step length in high-dimensional space.
     norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0) #clip gradient to avoid dangerous steps
 
