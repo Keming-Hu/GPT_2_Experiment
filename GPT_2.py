@@ -253,8 +253,7 @@ class DataLoaderLite:
         enc = tiktoken.get_encoding('gpt2')
         tokens = enc.encode(text)
         self.tokens = torch.tensor(tokens)
-        print(f"Total token length is: {len(tokens)}")
-        print(f"1 Epoch contains {len(tokens) // (B*T)} batches")
+        #print(f"Total token length is: {len(tokens)}")
 
         self.current_position = self.process_rank*self.B*self.T
 
@@ -274,6 +273,7 @@ class DataLoaderLite:
 #DDP: Distributed Data Parallel
 #** Everything below will likely be running in 8 parallel processes separately
 from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import os
 # using torchrun command to set up env var like: RANK, LOCAL_RANK, WORLD_SIZE
@@ -302,7 +302,6 @@ else:
 
 num_return_sequences = 5
 max_length = 30
-print("using device:", my_device) 
 
 torch.random.manual_seed(1337)
 if torch.cuda.is_available():
@@ -329,6 +328,10 @@ model = GPT(GPTConfig(vocab_size=50304)) #50304%128=0, a nicer number than the n
 model.to(my_device)
 #using torch.compile to accelerate
 model = torch.compile(model)
+#Check GPT_1.ipynb for AdamW. Hyperparams taken from GPT-3 paper
+#optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8) 
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, betas=(0.9,0.95), device_type=my_device)
+
 if ddp:
     #Note:use 'ddp_local_rank'; this conversion allows (in backward pass) gradients from different GPUs to get averaged, and synchronized back to all GPUs
     model = DDP(model, device_ids=[ddp_local_rank]) 
@@ -353,10 +356,6 @@ def get_lr(it):
     return min_lr + coeff * (max_lr-min_lr)
 
 
-#Check GPT_1.ipynb for AdamW. Hyperparams taken from GPT-3 paper
-#optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8) 
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, betas=(0.9,0.95), device_type=my_device)
-
 end_event = torch.cuda.Event()
 
 for i in range(50):
@@ -376,7 +375,7 @@ for i in range(50):
         #Otherwise, gradients would be multiplied...
         loss /= grad_accum_steps
         loss_accum += loss.detach() #detach the tensor from the graph, to save mem
-        if ddp:
+        if ddp: #Caution: NOT the STANDARD way to handle...might encounter version-specific issue
             model.require_backward_grad_sync = (micro_step == (grad_accum_steps-1)) #only make gradient sync true on the last iteration
         loss.backward() #since the zero_grad() is outside of the loop, loss grads accumulate here.
     if ddp:
@@ -399,9 +398,13 @@ for i in range(50):
     t1 = time.perf_counter()
 
     dt = (t1-t0) * 1000
-    tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps)/(t1-t0)
-    print(f"step {i}: loss {loss_accum.item()} | norm {norm:.4f} | dt={dt:.2f}ms |  tokens_per_sec={tokens_per_sec:.2f}")
+    tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size)/(t1-t0)
+    if master_process:
+        print(f"step {i}: loss {loss_accum.item()} | norm {norm:.4f} | dt={dt:.2f}ms |  tokens_per_sec={tokens_per_sec:.2f}")
     #notice that .item() is able to carry var back to CPU and print.
+
+if ddp:
+    destroy_process_group()
 
 import sys; sys.exit(0)
 
