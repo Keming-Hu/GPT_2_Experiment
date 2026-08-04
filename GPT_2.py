@@ -208,7 +208,7 @@ class GPT(nn.Module):
 
         return model
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, verbose):
         # filter out those that do not require grad
         param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
 
@@ -225,17 +225,21 @@ class GPT(nn.Module):
         # collect the number of tensors & params of each kind
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        
+        if verbose: #model param count stays the same, not divided by DDP; model just gets 8x copies
+            print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+            print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
 
         # Create AdamW optimizer and use the fused version if it is available
         #check if 'fused' is in the AdamW's **kwargs in the current version; if so, make an extra kwarg dict
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters 
+        device_type="cuda" if device_type.startswith("cuda") else device_type
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
-        torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8) 
+        #torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8) 
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, eps=1e-8, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
+        if verbose:
+            print(f"using fused AdamW: {use_fused}")
 
         return optimizer
 
@@ -326,11 +330,11 @@ train_loader = DataLoaderLite(B=16, T=1024, process_rank = ddp_rank, num_process
 model = GPT(GPTConfig(vocab_size=50304)) #50304%128=0, a nicer number than the natural 50257, so OVERWRITE
 #model.eval() #using evaluation mode, shutoff special layers like dropout, do minor optimization (maybe)
 model.to(my_device)
-#using torch.compile to accelerate
-model = torch.compile(model)
 #Check GPT_1.ipynb for AdamW. Hyperparams taken from GPT-3 paper
 #optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8) 
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, betas=(0.9,0.95), device_type=my_device)
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, betas=(0.9,0.95), device_type=my_device, verbose=master_process)
+#using torch.compile to accelerate
+model = torch.compile(model)
 
 if ddp:
     #Note:use 'ddp_local_rank'; this conversion allows (in backward pass) gradients from different GPUs to get averaged, and synchronized back to all GPUs
