@@ -5,6 +5,7 @@ from torch.nn import functional as F
 import tiktoken
 import inspect
 import time
+import os
 
 class CausalSelfAttention(nn.Module):
 
@@ -225,7 +226,7 @@ class GPT(nn.Module):
         # collect the number of tensors & params of each kind
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        
+
         if verbose: #model param count stays the same, not divided by DDP; model just gets 8x copies
             print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
             print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
@@ -243,23 +244,34 @@ class GPT(nn.Module):
 
         return optimizer
 
+import numpy as np
+def load_tokens(filename):
+    npt = np.load(filename)
+    ptt = torch.tensor(npt, dtype = torch.long)
+    return ptt
 
 class DataLoaderLite:
 
-    def __init__(self, B, T, process_rank, num_processes):
+    def __init__(self, B, T, process_rank, num_processes, split, master_process):
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
+        assert split in {'train', 'val'}
 
-        with open('input.txt','r') as f:
-            text = f.read()
-        enc = tiktoken.get_encoding('gpt2')
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
-        #print(f"Total token length is: {len(tokens)}")
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s] #find the correct set (train/val)
+        shards = sorted(shards) #arange in order
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len(shards)>0, f"0 shards found in split {split}."
+        if master_process:
+            print(f"found {len(shards)} shards for split {split}.")
 
-        self.current_position = self.process_rank*self.B*self.T
+        self.current_shard = 0 #initialized at shard 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = self.process_rank*self.B*self.T #the ending position of the batch
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -270,16 +282,21 @@ class DataLoaderLite:
         y = buf[1:].view(B,T)
         self.current_position += B*T*self.num_processes #WITHOUT Replacement, go to the next batch
 
+        #DDP might make the re-start boundaries a little bit different, since we need to fit in 8 B*T micro-batches to AVOID re-starting
         if self.current_position + B*T*self.num_processes +1 > len(self.tokens): #note that the range above is [,), so use '>'
-            self.current_position = 0
+            self.current_shard = (self.current_shard+1) % (len(self.shards)) #go to the next shard, start over if we need to
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = self.process_rank*self.B*self.T
         return x,y
 #---------------------------------------------------------------------------------------------------------------------------
+#LAUNCH SCRIPT: 
+# torchrun --standalone --nproc_per_node=8 GPT_2.py
+
 #DDP: Distributed Data Parallel
 #** Everything below will likely be running in 8 parallel processes separately
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
-import os
 # using torchrun command to set up env var like: RANK, LOCAL_RANK, WORLD_SIZE
 ddp = (int(os.environ.get('RANK',-1)) != -1) #a boolean: is this a DDP run?
 #os.environ returns a dict of OS settings; dict.get(key, default_val) returns default_val if key not found, else return value given by key
@@ -304,9 +321,6 @@ else:
     print("using device:", my_device) 
 
 
-num_return_sequences = 5
-max_length = 30
-
 torch.random.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.random.manual_seed(1337) 
@@ -321,31 +335,26 @@ if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"Gradient accumulation steps in each batch: {grad_accum_steps}")
 
-
-train_loader = DataLoaderLite(B=16, T=1024, process_rank = ddp_rank, num_processes = ddp_world_size)
-
+train_loader = DataLoaderLite(B=16, T=1024, process_rank= ddp_rank, num_processes= ddp_world_size, split='train',master_process= master_process)
 
 #8 identical models created in DDP
 #mode l = GPT.from_pretrained('gpt2')
 model = GPT(GPTConfig(vocab_size=50304)) #50304%128=0, a nicer number than the natural 50257, so OVERWRITE
 #model.eval() #using evaluation mode, shutoff special layers like dropout, do minor optimization (maybe)
 model.to(my_device)
-#Check GPT_1.ipynb for AdamW. Hyperparams taken from GPT-3 paper
-#optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8) 
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, betas=(0.9,0.95), device_type=my_device, verbose=master_process)
 #using torch.compile to accelerate
 model = torch.compile(model)
-
 if ddp:
     #Note:use 'ddp_local_rank'; this conversion allows (in backward pass) gradients from different GPUs to get averaged, and synchronized back to all GPUs
     model = DDP(model, device_ids=[ddp_local_rank]) 
+raw_model = model.module if ddp else model #take out the raw model reference
 
 #torch.set_float32_matmul_precision('high')
 
 max_lr = 6e-4 #according to GPT-3 small (125M)
 min_lr = max_lr * 0.1 #according to GPT-3
-warmup_steps = 10 #The climbing linear warmup in cosine decay
-max_steps = 50
+warmup_steps = 715 #The climbing linear warmup in cosine decay
+max_steps = 19073 #training set token num // total_batch_size
 
 import math
 
@@ -359,14 +368,18 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi*decay_ratio)) #take cos phase 0pi~1 pi, map to range [0,1]
     return min_lr + coeff * (max_lr-min_lr)
 
+#Check GPT_1.ipynb for AdamW. Hyperparams taken from GPT-3 paper
+#optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8) 
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, betas=(0.9,0.95), device_type=my_device, verbose=master_process)
 
 end_event = torch.cuda.Event()
 
-for i in range(50):
+for i in range(max_steps):
     t0 = time.perf_counter()
 
     optimizer.zero_grad()
     loss_accum = 0.0
+
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         #note that the DataLoaderLite class is a CPU-based class, 
@@ -382,9 +395,9 @@ for i in range(50):
         if ddp: #Caution: NOT the STANDARD way to handle...might encounter version-specific issue
             model.require_backward_grad_sync = (micro_step == (grad_accum_steps-1)) #only make gradient sync true on the last iteration
         loss.backward() #since the zero_grad() is outside of the loop, loss grads accumulate here.
+
     if ddp:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
-    
     
     #norm is the Euclidean length of the param gradients. Restriction is equivalent to restricting the step length in high-dimensional space.
     norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0) #clip gradient to avoid dangerous steps
