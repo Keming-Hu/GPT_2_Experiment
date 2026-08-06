@@ -260,7 +260,7 @@ class DataLoaderLite:
         assert split in {'train', 'val'}
 
         data_root = "edu_fineweb10B"
-        shards = os.listdir(data_root)
+        shards = os.listdir(data_root) #notice this shard sequence is just for filenames
         shards = [s for s in shards if split in s] #find the correct set (train/val)
         shards = sorted(shards) #arange in order
         shards = [os.path.join(data_root, s) for s in shards]
@@ -268,9 +268,13 @@ class DataLoaderLite:
         assert len(shards)>0, f"0 shards found in split {split}."
         if master_process:
             print(f"found {len(shards)} shards for split {split}.")
+        self.reset()
+        
 
+    def reset(self):
+        #restart at shard 0
         self.current_shard = 0 #initialized at shard 0
-        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.tokens = load_tokens(self.shards[self.current_shard]) #token count in the current shard
         self.current_position = self.process_rank*self.B*self.T #the ending position of the batch
 
     def next_batch(self):
@@ -286,7 +290,7 @@ class DataLoaderLite:
         if self.current_position + B*T*self.num_processes +1 > len(self.tokens): #note that the range above is [,), so use '>'
             self.current_shard = (self.current_shard+1) % (len(self.shards)) #go to the next shard, start over if we need to
             self.tokens = load_tokens(self.shards[self.current_shard])
-            self.current_position = self.process_rank*self.B*self.T
+            self.current_position = self.process_rank*self.B*self.T # ~ 131K
         return x,y
 #---------------------------------------------------------------------------------------------------------------------------
 #LAUNCH SCRIPT: 
@@ -335,7 +339,9 @@ if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"Gradient accumulation steps in each batch: {grad_accum_steps}")
 
-train_loader = DataLoaderLite(B=16, T=1024, process_rank= ddp_rank, num_processes= ddp_world_size, split='train',master_process= master_process)
+train_loader = DataLoaderLite(B=B, T=T, process_rank= ddp_rank, num_processes= ddp_world_size, split='train',master_process= master_process)
+val_loader = DataLoaderLite(B=B, T=T, process_rank= ddp_rank, num_processes= ddp_world_size, split='val',master_process= master_process)
+enc = tiktoken.get_encoding("gpt2")
 
 #8 identical models created in DDP
 #mode l = GPT.from_pretrained('gpt2')
@@ -349,7 +355,7 @@ if ddp:
     model = DDP(model, device_ids=[ddp_local_rank]) 
 raw_model = model.module if ddp else model #take out the raw model reference
 
-#torch.set_float32_matmul_precision('high')
+torch.set_float32_matmul_precision('high')
 
 max_lr = 6e-4 #according to GPT-3 small (125M)
 min_lr = max_lr * 0.1 #according to GPT-3
@@ -377,6 +383,57 @@ end_event = torch.cuda.Event()
 for i in range(max_steps):
     t0 = time.perf_counter()
 
+    #IF doing multi-epoch training, the val can help us monitor overfitting
+    if i%100 == 0: #print val loss progress every 100 optimization steps
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0
+            val_loss_steps = 20 
+            #note that for validation, we just go over these 20 whole batches, do grad accum, with just 1 total loss checkout
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch() 
+                #B*T per batch, 8 parallel processes, accumulate loss over 20 batches
+                x = x.to(my_device)
+                y = y.to(my_device)
+                with torch.autocast(device_type=my_device, dtype= torch.bfloat16):  
+                    logits, loss = model(x, y)
+                loss /= val_loss_steps
+                val_loss_accum += loss.detach()
+                #No backward needed
+        if ddp: 
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            print(f"validation loss: {val_loss_accum.item():.4f}")
+
+    if i>0 and i%100==0:
+        model.eval()
+        num_return_sequences = 4
+        max_length = 32
+        tokens = enc.encode("Hello, I'm a language model.")
+        tokens = torch.tensor(tokens, dtype = torch.long)
+        #unsqueeze: insert dimension at shape[x]; repeat: repeat tensor block by x rows, y times per row
+        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) 
+        xgen = tokens.to(my_device) #now x (B, T) -> (5, 8)
+        sample_rng = torch.Generator(device=my_device) #separate out one random number generator from the original one
+        sample_rng.manual_seed(42+ddp_rank)
+        while xgen.size(1) <= max_length:
+            with torch.no_grad():
+                logits, loss = model(xgen) #(B, T, vocab_size)
+                logits = logits[:, -1, :] #only taking the last on time dimension (newly generated)
+                probs = F.softmax(logits, dim = -1) #softmax across the vocab dim, (B, vocab_size)
+                #cut every possibilities after top 50 to 0, to avoid bizzare results
+                topk_probs, topk_ind = torch.topk(probs, 50, dim=-1) #(B, 50) topk_ind records token ID (i_th of 50257)
+                ix = torch.multinomial(topk_probs, 1) #(B, 1) now sampling makes the next token deterministic
+                xcol = torch.gather(topk_ind, -1, ix) # collect the ix_th element of each row (which is dim=-1)
+                xgen = torch.cat((xgen,xcol), dim=-1)
+
+        for i in range(num_return_sequences):
+            out_tokens = xgen[i, :max_length].tolist()
+            decoded = enc.decode(out_tokens)
+            print(f"Rank {ddp_rank}, sample {i}: {decoded}")
+
+    model.train() #switch back to train mode, just in case
     optimizer.zero_grad()
     loss_accum = 0.0
 
@@ -417,40 +474,8 @@ for i in range(max_steps):
     dt = (t1-t0) * 1000
     tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size)/(t1-t0)
     if master_process:
-        print(f"step {i}: loss {loss_accum.item()} | norm {norm:.4f} | dt={dt:.2f}ms |  tokens_per_sec={tokens_per_sec:.2f}")
+        print(f"step {i}: loss {loss_accum.item():.6f} | lr {lr:.4f} | norm {norm:.4f} | dt={dt:.2f}ms |  tokens_per_sec={tokens_per_sec:.2f}")
     #notice that .item() is able to carry var back to CPU and print.
 
-if ddp:
+if ddp: 
     destroy_process_group()
-
-import sys; sys.exit(0)
-
-
-
-
-
-tokens = enc.encode("Hello, I'm a language model.")
-tokens = torch.tensor(tokens, dtype = torch.long)
-#unsqueeze: insert dimension at shape[x]; repeat: repeat tensor block by x rows, y times per row
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) 
-x = tokens.to(my_device) #now x (B, T) -> (5, 8)
-
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-while x.size(1) <= max_length:
-    with torch.no_grad():
-        logits = model(x) #(B, T, vocab_size)
-        logits = logits[:,-1,:] #only taking the last on time dimension (newly generated)
-        probs = F.softmax(logits, dim = -1) #softmax across the vocab dim, (B, vocab_size)
-        #cut every possibilities after top 50 to 0, to avoid bizzare results
-        topk_probs, topk_ind = torch.topk(probs, 50, dim=-1) #(B, 50) topk_ind records token ID (i_th of 50257)
-        ix = torch.multinomial(topk_probs, 1) #(B, 1) now sampling makes the next token deterministic
-        xcol = torch.gather(topk_ind, -1, ix) # collect the ix_th element of each row (which is dim=-1)
-        x = torch.cat((x,xcol), dim=-1)
-
-for i in range(num_return_sequences):
-    out_tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(out_tokens)
-    print(">",decoded)
-
-
