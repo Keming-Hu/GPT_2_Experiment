@@ -332,7 +332,7 @@ if torch.cuda.is_available():
 
 #To run a big batch on a small GPU, use serial grad accumulation
 total_batch_size = 524288 #(1<<19), roughly 0.5M, ~GPT_2 small
-B = 16
+B = 64
 T = 1024
 assert total_batch_size % (B*T*ddp_world_size) == 0
 grad_accum_steps = total_batch_size //  (B*T*ddp_world_size)
@@ -438,9 +438,9 @@ for i in range(max_steps):
     if i%250==0 or last_step:
         num_correct_norm = 0
         num_total = 0
-        for i, example in enumerate(iterate_examples("val")):
+        for j, example in enumerate(iterate_examples("val")):
             # only process examples where i % ddp_world_size == ddp_rank, process distributively
-            if i % ddp_world_size != ddp_rank:
+            if j % ddp_world_size != ddp_rank:
                 continue
             # render the example into tokens and labels
             _, tokens, mask, label = render_example(example)
@@ -489,10 +489,10 @@ for i in range(max_steps):
                 xcol = torch.gather(topk_ind, -1, ix) # collect the ix_th element of each row (which is dim=-1)
                 xgen = torch.cat((xgen,xcol), dim=-1)
 
-        for i in range(num_return_sequences):
-            out_tokens = xgen[i, :max_length].tolist()
+        for j in range(num_return_sequences):
+            out_tokens = xgen[j, :max_length].tolist()
             decoded = enc.decode(out_tokens)
-            print(f"Rank {ddp_rank}, sample {i}: {decoded}")
+            print(f"Rank {ddp_rank}, sample {j}: {decoded}")
 
     model.train() #switch back to train mode, just in case
     optimizer.zero_grad()
@@ -540,7 +540,7 @@ for i in range(max_steps):
         with open(log_file, "a") as f:
             f.write(f"{i} train {loss_accum.item():.6f}\n")
 
-    if master_process and i > 0 and (i % 5000 == 0 or last_step):
+    if master_process and (i % 5000 == 0 or last_step):
         # optionally write model checkpoints
         cur_path = f"model_{i:05d}.pt"
         if last_step:
