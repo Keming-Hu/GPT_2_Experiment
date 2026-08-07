@@ -6,6 +6,7 @@ import tiktoken
 import inspect
 import time
 import os
+from hellaswag import iterate_examples, render_example
 
 class CausalSelfAttention(nn.Module):
 
@@ -374,17 +375,43 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi*decay_ratio)) #take cos phase 0pi~1 pi, map to range [0,1]
     return min_lr + coeff * (max_lr-min_lr)
 
+
+def get_most_likely_row(tokens, mask, logits):
+    shift_logits = (logits[..., :-1, :]).contiguous() #take all except the last prediction (which can't be tested) in time dimension
+    shift_tokens = (tokens[..., 1:]).contiguous() #make the answer sheet
+    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1)) #flatten for softmax
+    flat_shift_tokens = shift_tokens.view(-1)
+    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
+    shift_losses = shift_losses.view(tokens.size(0), -1) #shape the batch dimension as 'tokens'
+    # now get the average loss just for the completion region (where mask == 1), in each row
+    shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
+    masked_shift_losses = shift_losses * shift_mask #element-wise production
+    # sum and divide by the number of 1s in the mask
+    sum_loss = masked_shift_losses.sum(dim=1) #sum up across the time dimension
+    avg_loss = sum_loss / shift_mask.sum(dim=1) #divided by the length of the option (excluding the padding)
+    # now we have a loss for each of the 4 completions
+    # the one with the lowest loss should be the most likely
+    pred_norm = avg_loss.argmin().item()
+    return pred_norm
+
 #Check GPT_1.ipynb for AdamW. Hyperparams taken from GPT-3 paper
 #optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8) 
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, betas=(0.9,0.95), device_type=my_device, verbose=master_process)
+
+log_dir = 'log'
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+with open(log_file, "w") as f: 
+    pass
 
 end_event = torch.cuda.Event()
 
 for i in range(max_steps):
     t0 = time.perf_counter()
+    last_step = (i == max_steps-1)
 
     #IF doing multi-epoch training, the val can help us monitor overfitting
-    if i%100 == 0: #print val loss progress every 100 optimization steps
+    if i%250 == 0 or last_step: #print val loss progress every 100 optimization steps
         model.eval()
         val_loader.reset()
         with torch.no_grad():
@@ -405,8 +432,42 @@ for i in range(max_steps):
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
         if master_process:
             print(f"validation loss: {val_loss_accum.item():.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{i} val {val_loss_accum.item():.4f}\n")
 
-    if i>0 and i%100==0:
+    if i%250==0 or last_step:
+        num_correct_norm = 0
+        num_total = 0
+        for i, example in enumerate(iterate_examples("val")):
+            # only process examples where i % ddp_world_size == ddp_rank, process distributively
+            if i % ddp_world_size != ddp_rank:
+                continue
+            # render the example into tokens and labels
+            _, tokens, mask, label = render_example(example)
+            tokens = tokens.to(my_device)
+            mask = mask.to(my_device)
+            # get the logits
+            with torch.no_grad():
+                with torch.autocast(device_type=my_device, dtype=torch.bfloat16):
+                    logits, loss = model(tokens)
+                pred_norm = get_most_likely_row(tokens, mask, logits)
+            num_total += 1
+            num_correct_norm += int(pred_norm == label)
+        # reduce the stats across all processes
+        if ddp:
+            num_total = torch.tensor(num_total, dtype=torch.long, device=my_device) #torchify...
+            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=my_device)
+            dist.all_reduce(num_total, op=dist.ReduceOp.SUM) #sum across all processes
+            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+            num_total = num_total.item() #take out the values
+            num_correct_norm = num_correct_norm.item()
+        acc_norm = num_correct_norm / num_total #do final accuracy calculation
+        if master_process:
+            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{i} hella {acc_norm:.4f}\n")
+
+    if i>0 and (i%250==0 or last_step):
         model.eval()
         num_return_sequences = 4
         max_length = 32
@@ -475,7 +536,28 @@ for i in range(max_steps):
     tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size)/(t1-t0)
     if master_process:
         print(f"step {i}: loss {loss_accum.item():.6f} | lr {lr:.4f} | norm {norm:.4f} | dt={dt:.2f}ms |  tokens_per_sec={tokens_per_sec:.2f}")
-    #notice that .item() is able to carry var back to CPU and print.
+        #notice that .item() is able to carry var back to CPU and print.
+        with open(log_file, "a") as f:
+            f.write(f"{i} train {loss_accum.item():.6f}\n")
+
+    if master_process and i > 0 and (i % 5000 == 0 or last_step):
+        # optionally write model checkpoints
+        cur_path = f"model_{i:05d}.pt"
+        if last_step:
+            cur_path = f"model_final.pt"
+        checkpoint_path = os.path.join(log_dir, cur_path)
+        checkpoint = {
+            'model': raw_model.state_dict(),
+            'config': raw_model.config,
+            'step': i,
+            'val_loss': val_loss_accum.item()
+        }
+        if last_step:
+            checkpoint['optimizer'] = optimizer.state_dict()
+            checkpoint["cuda_rng_state"] = torch.cuda.get_rng_state_all()
+        # add optimizer.state_dict() and rng seeds to more exactly resume training
+        torch.save(checkpoint, checkpoint_path)
+        print(f"Successfully saved checkpoint at step {i}.")
 
 if ddp: 
     destroy_process_group()
